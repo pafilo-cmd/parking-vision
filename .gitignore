@@ -1,0 +1,22 @@
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pesos de modelos YOLO (se descargan automáticamente al iniciar)
+*.pt
+*.onnx
+
+# Capturas locales generadas por el usuario
+capturas/
+
+# Archivos de sistema e IDE
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
