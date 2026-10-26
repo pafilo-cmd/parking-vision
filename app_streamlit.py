@@ -182,7 +182,7 @@ def capturar_y_analizar(
     if frame_bgr is None:
         registrar_log(
             f"⚠️ [RED] Sin respuesta temporal de la cámara [{cam_id}] "
-            f"{obtener_nombre_camara(cam_id)}."
+            f"{obtener_nombre_camara(cam_id)} (probado directo + pasarelas/proxies ES)."
         )
         return False
 
@@ -208,10 +208,11 @@ def capturar_y_analizar(
         "vehiculos": vehiculos,
         "observacion": en_obs,
         "hora": hora_str,
+        "via_conexion": cam.ultimo_metodo_conexion,
     }
 
     registrar_log(
-        f"[{cam_id}] {obtener_nombre_camara(cam_id)} -> "
+        f"[{cam_id}] {obtener_nombre_camara(cam_id)} ({cam.ultimo_metodo_conexion}) -> "
         f"Libres: {libres}/{total} | Vehículos en vía: {vehiculos}"
     )
     return True
@@ -324,6 +325,18 @@ def main() -> None:
                 f"✨ Aprendizaje IA reiniciado en [{cam_seleccionada}] "
                 f"{obtener_nombre_camara(cam_seleccionada)}."
             )
+
+        with st.expander("🌐 Enrutamiento / Proxy España"):
+            st.caption(
+                "Si `camaras.vigo.org` bloquea la IP de Streamlit Cloud, la app busca "
+                "automáticamente pasarelas y proxies en España (`country=ES`). "
+                "También puedes indicar un proxy HTTP fijo aquí:"
+            )
+            proxy_manual = st.text_input(
+                "Proxy HTTP opcional (ip:puerto)",
+                placeholder="Ej: http://212.231.230.141:8080",
+            )
+            st.session_state.cliente_camara.configurar_proxy_manual(proxy_manual)
 
         # Gestión rápida de plazas desde la web (eliminar plaza por ID si alguna sobra)
         if analizador.total_plazas > 0:
