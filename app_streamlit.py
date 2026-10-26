@@ -105,6 +105,13 @@ def inicializar_estado() -> None:
         ]
     if "cam_id_actual" not in st.session_state:
         st.session_state.cam_id_actual = "05"
+    if "cliente_camara" not in st.session_state:
+        st.session_state.cliente_camara = CamaraVigo(
+            cam_id="05",
+            scale_factor=2.0,
+            timeout=10.0,
+            max_retries=3,
+        )
     if "ultimo_jpg_bytes" not in st.session_state:
         st.session_state.ultimo_jpg_bytes = None
     if "ultima_img_rgb" not in st.session_state:
@@ -168,8 +175,9 @@ def capturar_y_analizar(
     analizador.dibujar_detecciones = mostrar_cajas
     analizador.auto_calibrar = auto_calibrar
 
-    with CamaraVigo(cam_id=cam_id, scale_factor=analizador.scale_factor, timeout=6.0) as cam:
-        frame_bgr = cam.obtener_frame()
+    cam: CamaraVigo = st.session_state.cliente_camara
+    cam.cambiar_camara(cam_id, scale_factor=analizador.scale_factor)
+    frame_bgr = cam.obtener_frame()
 
     if frame_bgr is None:
         registrar_log(

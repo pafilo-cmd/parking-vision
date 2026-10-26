@@ -1,7 +1,7 @@
 """
 Módulo para la captura y decodificación de imágenes desde las cámaras de tráfico del Concello de Vigo.
-Incluye el catálogo oficial de cámaras con sus identificadores y ubicaciones.
-Preparado para su integración con PyQt6 y procesamiento con OpenCV/YOLO.
+Incluye el catálogo oficial de cámaras, cabeceras completas de navegador de escritorio y
+sistema de reintentos cortos (retries) optimizado tanto para ejecución local como en Streamlit Cloud.
 """
 
 from typing import Optional
@@ -12,7 +12,19 @@ import time
 import cv2
 import numpy as np
 import requests
-from requests.exceptions import RequestException, Timeout, ConnectionError, HTTPError
+from requests.adapters import HTTPAdapter
+from requests.exceptions import (
+    ConnectionError,
+    HTTPError,
+    RequestException,
+    SSLError,
+    Timeout,
+)
+import urllib3
+from urllib3.util.retry import Retry
+
+# Evitar warnings en consola si en algún entorno cloud se requiere fallback sin verificación SSL estricta
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configuración básica de logging para trazabilidad
 logger = logging.getLogger(__name__)
@@ -88,22 +100,18 @@ CAMARAS_VIGO: dict[str, str] = {
 OPEN_DATA_CAMARAS_URL: str = "https://datos.vigo.org/data/trafico/camaras.json"
 
 
-def obtener_catalogo_camaras(actualizar_online: bool = False, timeout: float = 4.0) -> dict[str, str]:
+def obtener_catalogo_camaras(actualizar_online: bool = False, timeout: float = 5.0) -> dict[str, str]:
     """
     Devuelve el diccionario `{cam_id: nombre_ubicacion}` de todas las cámaras de Vigo.
-
-    Args:
-        actualizar_online: Si es True, consulta el portal Open Data de Vigo para obtener
-            posibles cámaras nuevas, usando `CAMARAS_VIGO` como respaldo seguro.
-        timeout: Tiempo máximo de espera si se consulta el servidor Open Data.
-
-    Returns:
-        Diccionario ordenado por ID con los identificadores y ubicaciones.
     """
     catalogo = dict(CAMARAS_VIGO)
     if actualizar_online:
         try:
-            resp = requests.get(OPEN_DATA_CAMARAS_URL, timeout=timeout)
+            resp = requests.get(
+                OPEN_DATA_CAMARAS_URL,
+                headers=CamaraVigo.DEFAULT_HEADERS,
+                timeout=timeout,
+            )
             resp.raise_for_status()
             try:
                 datos = json.loads(resp.content.decode("cp1252"))
@@ -129,16 +137,34 @@ def obtener_nombre_camara(cam_id: int | str) -> str:
 
 class CamaraVigo:
     """
-    Cliente para obtener fotogramas en tiempo real de las cámaras de tráfico de Vigo.
+    Cliente robusto para obtener fotogramas en tiempo real de las cámaras de tráfico de Vigo.
+    Incluye cabeceras completas de navegador de escritorio y reintentos automáticos ante
+    latencia o rechazos puntuales desde servidores cloud (como Streamlit Cloud).
     """
 
-    BASE_URL: str = "http://camaras.vigo.org/webcam/camv2.php"
+    # Usamos directamente HTTPS para evitar el salto 301 Redirect adicional en cada petición
+    BASE_URL: str = "https://camaras.vigo.org/webcam/camv2.php"
+    FALLBACK_HTTP_URL: str = "http://camaras.vigo.org/webcam/camv2.php"
+
+    # Diccionario completo de cabeceras simulando un navegador Chrome de escritorio real
     DEFAULT_HEADERS: dict[str, str] = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
+            "Chrome/124.0.0.0 Safari/537.36"
         ),
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Language": "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://camaras.vigo.org/",
+        "Origin": "https://camaras.vigo.org",
+        "Connection": "keep-alive",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "image",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "same-origin",
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "Pragma": "no-cache",
         "Expires": "0",
@@ -148,27 +174,54 @@ class CamaraVigo:
         self,
         cam_id: int | str = "05",
         scale_factor: float = 1.0,
-        timeout: float = 5.0,
+        timeout: float = 10.0,
+        max_retries: int = 3,
     ) -> None:
         """
-        Inicializa el conector de la cámara.
+        Inicializa el conector de la cámara con sesión persistente y política de reintentos.
 
         Args:
             cam_id: Identificador de la cámara del Concello de Vigo.
             scale_factor: Factor de escalado opcional para la imagen resultante (por defecto 1.0).
-            timeout: Tiempo máximo de espera por petición HTTP en segundos.
+            timeout: Tiempo máximo de espera por petición HTTP en segundos (por defecto 10.0).
+            max_retries: Número máximo de reintentos cortos ante fallos transitorios de red.
         """
         if scale_factor <= 0:
             raise ValueError("El factor de escala (scale_factor) debe ser mayor que 0.")
 
         self.cam_id = str(cam_id)
         self.scale_factor = scale_factor
-        self.timeout = timeout
+        self.timeout = float(timeout)
+        self.max_retries = max(1, int(max_retries))
 
-        # Usamos requests.Session para reutilizar conexiones TCP (Keep-Alive)
-        # y mejorar el rendimiento en refrescos frecuentes desde un QThread.
-        self._session = requests.Session()
-        self._session.headers.update(self.DEFAULT_HEADERS)
+        self._session = self._crear_sesion_con_reintentos()
+
+    def _crear_sesion_con_reintentos(self) -> requests.Session:
+        """
+        Configura una sesión `requests.Session` con cabeceras de navegador y un `HTTPAdapter`
+        con reintentos automáticos a nivel de transporte TCP/HTTP.
+        """
+        sesion = requests.Session()
+        sesion.headers.update(self.DEFAULT_HEADERS)
+
+        estrategia_retry = Retry(
+            total=self.max_retries,
+            connect=self.max_retries,
+            read=2,
+            status=2,
+            backoff_factor=0.35,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+            raise_on_status=False,
+        )
+        adaptador = HTTPAdapter(
+            max_retries=estrategia_retry,
+            pool_connections=4,
+            pool_maxsize=8,
+        )
+        sesion.mount("https://", adaptador)
+        sesion.mount("http://", adaptador)
+        return sesion
 
     @property
     def ubicacion(self) -> str:
@@ -183,95 +236,128 @@ class CamaraVigo:
 
     def obtener_frame(self, scale_factor: Optional[float] = None) -> Optional[np.ndarray]:
         """
-        Descarga el fotograma actual de la cámara y lo decodifica en formato BGR de OpenCV.
+        Descarga el fotograma actual de la cámara con reintentos cortos y lo decodifica
+        en formato BGR de OpenCV.
 
         Args:
             scale_factor: Factor de escala puntual (si no se especifica, usa el de la instancia).
 
         Returns:
             Un array de NumPy (H, W, 3) en formato BGR si la descarga fue exitosa,
-            o None si ocurrió algún error de red o decodificación.
+            o None si tras los reintentos ocurrió algún error de red o decodificación.
         """
         escala = scale_factor if scale_factor is not None else self.scale_factor
         if escala <= 0:
             logger.error("Factor de escala inválido: %s", escala)
             return None
 
-        # Timestamp en milisegundos como parámetro anti-caché
-        timestamp_ms = int(time.time() * 1000)
-        params = {
-            "id": self.cam_id,
-            "t": timestamp_ms,
-        }
+        # Tupla (connect_timeout, read_timeout) para no quedar bloqueado en handshakes lentos
+        timeout_tupla = (min(5.0, self.timeout), self.timeout)
 
-        try:
-            response = self._session.get(
-                self.BASE_URL,
-                params=params,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
+        for intento in range(1, self.max_retries + 1):
+            # Timestamp en milisegundos como parámetro anti-caché renovado en cada intento
+            timestamp_ms = int(time.time() * 1000)
+            params = {
+                "id": self.cam_id,
+                "t": timestamp_ms,
+            }
 
-            if not response.content:
-                logger.warning("Respuesta vacía desde la cámara ID %s.", self.cam_id)
-                return None
+            try:
+                try:
+                    response = self._session.get(
+                        self.BASE_URL,
+                        params=params,
+                        timeout=timeout_tupla,
+                    )
+                except SSLError:
+                    # Fallback sin verificación estricta si el contenedor cloud carece de CA intermedia
+                    response = self._session.get(
+                        self.BASE_URL,
+                        params=params,
+                        timeout=timeout_tupla,
+                        verify=False,
+                    )
 
-            # Convertir los bytes recibidos en un buffer de NumPy y decodificar con OpenCV
-            image_array = np.frombuffer(response.content, dtype=np.uint8)
-            frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+                response.raise_for_status()
 
-            if frame is None:
+                if not response.content or len(response.content) < 256:
+                    logger.warning(
+                        "Respuesta vacía o incompleta desde cámara ID %s (intento %d/%d).",
+                        self.cam_id,
+                        intento,
+                        self.max_retries,
+                    )
+                    if intento < self.max_retries:
+                        time.sleep(0.4 * intento)
+                        continue
+                    return None
+
+                # Convertir los bytes recibidos en un buffer de NumPy y decodificar con OpenCV
+                image_array = np.frombuffer(response.content, dtype=np.uint8)
+                frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+
+                if frame is None:
+                    logger.warning(
+                        "No se pudo decodificar la imagen de la cámara ID %s (intento %d/%d).",
+                        self.cam_id,
+                        intento,
+                        self.max_retries,
+                    )
+                    if intento < self.max_retries:
+                        time.sleep(0.4 * intento)
+                        continue
+                    return None
+
+                # Aplicar redimensionado si el factor de escala es distinto de 1.0
+                if escala != 1.0:
+                    interp = cv2.INTER_AREA if escala < 1.0 else cv2.INTER_LINEAR
+                    frame = cv2.resize(
+                        frame,
+                        dsize=None,
+                        fx=escala,
+                        fy=escala,
+                        interpolation=interp,
+                    )
+
+                return frame
+
+            except (Timeout, ConnectionError) as exc:
                 logger.warning(
-                    "No se pudo decodificar la imagen de la cámara ID %s (contenido no válido).",
+                    "Intento %d/%d fallido por red/timeout en cámara ID %s (%s): %s",
+                    intento,
+                    self.max_retries,
                     self.cam_id,
+                    self.ubicacion,
+                    exc,
+                )
+            except HTTPError as exc:
+                logger.error(
+                    "Error HTTP %s en cámara ID %s (intento %d/%d): %s",
+                    exc.response.status_code if exc.response is not None else "desconocido",
+                    self.cam_id,
+                    intento,
+                    self.max_retries,
+                    exc,
+                )
+            except RequestException as exc:
+                logger.error(
+                    "Error en la petición para la cámara ID %s (intento %d/%d): %s",
+                    self.cam_id,
+                    intento,
+                    self.max_retries,
+                    exc,
+                )
+            except cv2.error as exc:
+                logger.error(
+                    "Error de OpenCV procesando el frame de la cámara ID %s: %s",
+                    self.cam_id,
+                    exc,
                 )
                 return None
 
-            # Aplicar redimensionado si el factor de escala es distinto de 1.0
-            if escala != 1.0:
-                interp = cv2.INTER_AREA if escala < 1.0 else cv2.INTER_LINEAR
-                frame = cv2.resize(
-                    frame,
-                    dsize=None,
-                    fx=escala,
-                    fy=escala,
-                    interpolation=interp,
-                )
-
-            return frame
-
-        except Timeout:
-            logger.error(
-                "Timeout (>%ss) al conectar con la cámara ID %s (%s).",
-                self.timeout,
-                self.cam_id,
-                self.ubicacion,
-            )
-        except ConnectionError as exc:
-            logger.error(
-                "Error de conexión al acceder a la cámara ID %s: %s",
-                self.cam_id,
-                exc,
-            )
-        except HTTPError as exc:
-            logger.error(
-                "Error HTTP %s en la cámara ID %s: %s",
-                exc.response.status_code if exc.response is not None else "desconocido",
-                self.cam_id,
-                exc,
-            )
-        except RequestException as exc:
-            logger.error(
-                "Error en la petición para la cámara ID %s: %s",
-                self.cam_id,
-                exc,
-            )
-        except cv2.error as exc:
-            logger.error(
-                "Error de OpenCV procesando el frame de la cámara ID %s: %s",
-                self.cam_id,
-                exc,
-            )
+            # Pequeña espera progresiva antes del siguiente reintento
+            if intento < self.max_retries:
+                time.sleep(0.45 * intento)
 
         return None
 
@@ -289,7 +375,7 @@ class CamaraVigo:
 def descargar_frame_vigo(
     cam_id: int | str,
     scale_factor: float = 1.0,
-    timeout: float = 5.0,
+    timeout: float = 10.0,
 ) -> Optional[np.ndarray]:
     """
     Función auxiliar de conveniencia para realizar una captura puntual sin instanciar la clase.
